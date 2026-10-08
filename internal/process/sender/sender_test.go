@@ -69,7 +69,11 @@ func validSnapshot() models.ProcessPayload {
 func TestClient_Send_Success(t *testing.T) {
 	mockClient := &mockHTTPClient{
 		statusCode: http.StatusAccepted,
-		response:   sender.Response{Received: 1},
+		response: sender.Response{
+			Data: &struct {
+				Received int `json:"received"`
+			}{Received: 1},
+		},
 	}
 	mockCol := &mockCollector{snapshot: validSnapshot()}
 
@@ -79,8 +83,8 @@ func TestClient_Send_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if resp.Received != 1 {
-		t.Errorf("expected received=1, got %d", resp.Received)
+	if resp.Data == nil || resp.Data.Received != 1 {
+		t.Errorf("expected received=1, got %+v", resp.Data)
 	}
 	if mockClient.lastEndpoint != "/api/v1/agents/agent-123/processes" {
 		t.Errorf("unexpected endpoint: %s", mockClient.lastEndpoint)
@@ -160,7 +164,11 @@ func TestClient_Send_MissingCredentials(t *testing.T) {
 func TestRunner_Execution(t *testing.T) {
 	mockClient := &mockHTTPClient{
 		statusCode: http.StatusAccepted,
-		response:   sender.Response{Received: 1},
+		response: sender.Response{
+			Data: &struct {
+				Received int `json:"received"`
+			}{Received: 1},
+		},
 	}
 	mockCol := &mockCollector{snapshot: validSnapshot()}
 	client := sender.NewClient(mockClient, mockCol)

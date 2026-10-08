@@ -25,8 +25,10 @@ var (
 
 // Response matches the expected success response from POST /api/v1/agents/{agentId}/processes
 type Response struct {
-	Received int `json:"received"`
-	Error    *struct {
+	Data *struct {
+		Received int `json:"received"`
+	} `json:"data,omitempty"`
+	Error *struct {
 		Message string `json:"message"`
 	} `json:"error,omitempty"`
 }
@@ -180,7 +182,11 @@ func (r *Runner) executeSubmission(ctx context.Context) {
 		return
 	}
 
-	log.Printf("[DEBUG] process snapshot submitted successfully: received=%d processes", resp.Received)
+	receivedCount := 0
+	if resp != nil && resp.Data != nil {
+		receivedCount = resp.Data.Received
+	}
+	log.Printf("[DEBUG] process snapshot submitted successfully: received=%d processes", receivedCount)
 }
 
 // Stop signals the runner loop to terminate and blocks until it cleanly exits.
