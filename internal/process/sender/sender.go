@@ -12,6 +12,8 @@ import (
 	"vpsmonitoring-agent/internal/client"
 	"vpsmonitoring-agent/internal/process/collector"
 	"vpsmonitoring-agent/internal/process/models"
+
+	"github.com/shirou/gopsutil/v4/mem"
 )
 
 var (
@@ -168,7 +170,14 @@ func (r *Runner) executeSubmission(ctx context.Context) {
 	}
 	defer r.mu.Unlock()
 
-	resp, err := r.client.Send(ctx, r.agentID, r.credential, r.totalMemBytes)
+	memBytes := r.totalMemBytes
+	if memBytes == 0 {
+		if vm, err := mem.VirtualMemoryWithContext(ctx); err == nil && vm != nil {
+			memBytes = vm.Total
+		}
+	}
+
+	resp, err := r.client.Send(ctx, r.agentID, r.credential, memBytes)
 	if err != nil {
 		if errors.Is(err, ErrUnauthorized) {
 			log.Println("[ERROR] process submission unauthorized (401); agent credential invalid or revoked")

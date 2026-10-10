@@ -20,6 +20,11 @@ package collector
 import (
 	"context"
 	"log"
+	"os/user"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	gops "github.com/shirou/gopsutil/v4/process"
@@ -30,11 +35,17 @@ import (
 const (
 	// MaxProcessCount is the hard upper bound on the number of processes returned
 	// per collection. This bounds both memory usage and payload size.
-	MaxProcessCount = 200
+	MaxProcessCount = 500
 
 	// collectionTimeout is the maximum wall-clock time the collector may spend
 	// enumerating processes before returning whatever it has collected so far.
-	collectionTimeout = 2 * time.Second
+	collectionTimeout = 15 * time.Second
+)
+
+// fast user cache across process enumeration cycles
+var (
+	userCache   = make(map[uint32]string)
+	userCacheMu sync.RWMutex
 )
 
 // ProcessCollector defines the interface for collecting a process snapshot.
@@ -71,7 +82,7 @@ func NewProcessCollectorWithLister(l func(ctx context.Context) ([]*gops.Process,
 	return &defaultProcessCollector{lister: l}
 }
 
-// Collect enumerates running processes under a bounded 2-second timeout.
+// Collect enumerates running processes concurrently with a worker pool.
 //
 // totalMemBytes is the system's total physical RAM in bytes, used to compute
 // MemoryPercent. Pass 0 if unknown; MemoryPercent will then be nil.
@@ -81,7 +92,7 @@ func (c *defaultProcessCollector) Collect(ctx context.Context, totalMemBytes uin
 		Processes:   make([]models.ProcessSnapshot, 0, MaxProcessCount),
 	}
 
-	// Enforce a hard collection timeout independently of the parent context.
+	// Enforce a collection timeout independently of the parent context.
 	collectCtx, cancel := context.WithTimeout(ctx, collectionTimeout)
 	defer cancel()
 
@@ -94,42 +105,58 @@ func (c *defaultProcessCollector) Collect(ctx context.Context, totalMemBytes uin
 
 	now := time.Now().UTC()
 
-	for _, p := range procs {
-		// Enforce hard cap to bound memory and payload size.
-		if len(payload.Processes) >= MaxProcessCount {
-			break
-		}
-
-		// Check context deadline: stop early rather than blocking.
-		select {
-		case <-collectCtx.Done():
-			log.Printf("[WARN] process collection timeout reached after %d processes; returning partial snapshot",
-				len(payload.Processes))
-			return payload
-		default:
-		}
-
-		snap, ok := collectProcess(collectCtx, p, totalMemBytes, now)
-		if !ok {
-			// PID or Name unavailable; skip this entry entirely.
-			continue
-		}
-
-		payload.Processes = append(payload.Processes, snap)
+	numWorkers := 16
+	if len(procs) < numWorkers {
+		numWorkers = len(procs)
+	}
+	if numWorkers == 0 {
+		return payload
 	}
 
+	procChan := make(chan *gops.Process, len(procs))
+	for _, p := range procs {
+		procChan <- p
+	}
+	close(procChan)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	collected := make([]models.ProcessSnapshot, 0, len(procs))
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := range procChan {
+				select {
+				case <-collectCtx.Done():
+					return
+				default:
+				}
+
+				snap, ok := collectProcess(collectCtx, p, totalMemBytes, now)
+				if !ok {
+					continue
+				}
+
+				mu.Lock()
+				if len(collected) < MaxProcessCount {
+					collected = append(collected, snap)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+	payload.Processes = collected
 	log.Printf("[DEBUG] ProcessCollector: retained %d processes", len(payload.Processes))
 	return payload
 }
 
 // collectProcess builds a ProcessSnapshot for a single gopsutil process.
-//
-// Returns (snapshot, true) when PID and Name are available.
-// Returns (zero, false) when either required field cannot be obtained.
-// For all optional fields, individual failures result in nil, not an omission.
 func collectProcess(ctx context.Context, p *gops.Process, totalMemBytes uint64, now time.Time) (models.ProcessSnapshot, bool) {
 	// --- Required: PID --------------------------------------------------
-	// gopsutil Process.Pid is a public int32 field; no error is returned.
 	pid := int64(p.Pid)
 
 	// --- Required: Name -------------------------------------------------
@@ -153,17 +180,44 @@ func collectProcess(ctx context.Context, p *gops.Process, totalMemBytes uint64, 
 	}
 
 	// --- Optional: CPUPercent -------------------------------------------
-	// Percent(0) returns instantaneous usage since the last call for this
-	// PID (or since boot on the first call). Values may exceed 100% on
-	// multi-core systems. We do NOT clamp.
-	if cpuPct, err := p.PercentWithContext(ctx, 0); err == nil {
+	if cpuPct, err := p.CPUPercentWithContext(ctx); err == nil && cpuPct > 0 {
+		snap.CPUPercent = &cpuPct
+	} else if cpuPct, err := p.PercentWithContext(ctx, 0); err == nil {
 		snap.CPUPercent = &cpuPct
 	}
 
-	// --- Optional: MemoryBytes + MemoryPercent --------------------------
+	// --- Optional: User (with high-speed in-memory cache) ----------------
+	if uids, err := p.UidsWithContext(ctx); err == nil && len(uids) > 0 {
+		uid := uids[0]
+		userCacheMu.RLock()
+		uName, ok := userCache[uid]
+		userCacheMu.RUnlock()
+		if ok {
+			snap.User = uName
+		} else {
+			if u, err := user.LookupId(strconv.Itoa(int(uid))); err == nil && u != nil {
+				userCacheMu.Lock()
+				userCache[uid] = u.Username
+				userCacheMu.Unlock()
+				snap.User = u.Username
+			} else if uname, err := p.UsernameWithContext(ctx); err == nil && uname != "" {
+				userCacheMu.Lock()
+				userCache[uid] = uname
+				userCacheMu.Unlock()
+				snap.User = uname
+			}
+		}
+	} else if u, err := p.UsernameWithContext(ctx); err == nil && u != "" {
+		snap.User = u
+	}
+
+	// --- Optional: MemoryBytes + MemoryPercent + VirtBytes --------------
 	if memInfo, err := p.MemoryInfoWithContext(ctx); err == nil && memInfo != nil {
 		rss := memInfo.RSS
 		snap.MemoryBytes = &rss
+
+		vms := memInfo.VMS
+		snap.VirtBytes = &vms
 
 		if totalMemBytes > 0 {
 			pct := (float64(rss) / float64(totalMemBytes)) * 100.0
@@ -179,13 +233,12 @@ func collectProcess(ctx context.Context, p *gops.Process, totalMemBytes uint64, 
 
 	// --- Optional: StartTime + UptimeSeconds ----------------------------
 	if createMs, err := p.CreateTimeWithContext(ctx); err == nil {
-		// gopsutil returns Unix milliseconds.
 		startTime := time.UnixMilli(createMs).UTC()
 		snap.StartTime = &startTime
 
 		uptimeSec := int64(now.Sub(startTime).Seconds())
 		if uptimeSec < 0 {
-			uptimeSec = 0 // Guard against clock skew.
+			uptimeSec = 0
 		}
 		snap.UptimeSeconds = &uptimeSec
 	}
@@ -194,6 +247,18 @@ func collectProcess(ctx context.Context, p *gops.Process, totalMemBytes uint64, 
 	if threads, err := p.NumThreadsWithContext(ctx); err == nil {
 		t := int32(threads)
 		snap.Threads = &t
+	}
+
+	// --- Optional: Command Line -----------------------------------------
+	if cmd, err := p.CmdlineWithContext(ctx); err == nil && cmd != "" {
+		fields := strings.Fields(cmd)
+		if len(fields) > 0 {
+			snap.Cmdline = filepath.Base(fields[0])
+		} else {
+			snap.Cmdline = cmd
+		}
+	} else {
+		snap.Cmdline = name
 	}
 
 	return snap, true

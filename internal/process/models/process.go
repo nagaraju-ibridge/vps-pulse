@@ -79,6 +79,15 @@ type ProcessSnapshot struct {
 
 	// Threads is the number of threads in the process. Nil when unavailable.
 	Threads *int32 `json:"threads,omitempty"`
+
+	// User is the operating-system user owning the process (e.g. "vocc", "mysql").
+	User string `json:"user,omitempty"`
+
+	// VirtBytes is the virtual memory size in bytes (VIRT in top). Nil when unavailable.
+	VirtBytes *uint64 `json:"virt_bytes,omitempty"`
+
+	// Cmdline is the process command / executable name (e.g. "php-fpm8.2", "mariadbd").
+	Cmdline string `json:"cmdline,omitempty"`
 }
 
 // ProcessPayload is the top-level structure sent by the agent to the backend.

@@ -128,7 +128,8 @@ func main() {
 
 	// 10. Initialize and launch Application Discovery Reporting (Phase 3.5C.8)
 	discoveryCollector := discoverycollector.NewDiscoveryCollector()
-	discoveryClient := discoverysender.NewClient(httpClient, discoveryCollector)
+	discoveryHTTPClient := client.NewClient(cfg.BackendURL, 90*time.Second)
+	discoveryClient := discoverysender.NewClient(discoveryHTTPClient, discoveryCollector)
 	discoveryRunner := discoverysender.NewRunner(discoveryClient, agentID, agentCredential, cfg.DiscoveryInterval)
 	discoveryRunner.Start(ctx)
 

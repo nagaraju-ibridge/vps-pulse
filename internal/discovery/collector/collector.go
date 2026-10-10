@@ -15,6 +15,9 @@ import (
 	"log"
 
 	"vpsmonitoring-agent/internal/discovery/models"
+	"vpsmonitoring-agent/internal/discovery/users"
+	"vpsmonitoring-agent/internal/discovery/web/apache"
+	"vpsmonitoring-agent/internal/discovery/web/nginx"
 )
 
 var procRoot = "/proc"
@@ -170,6 +173,51 @@ func (c *defaultDiscoveryCollector) Collect(ctx context.Context) models.Discover
 	log.Printf("[DEBUG] applications classified: %d, services classified: %d", len(payload.Applications), len(payload.Services))
 
 	sortPayload(&payload)
+
+	// Execute Web Discovery (W1 & W3)
+	nginxCol := nginx.NewCollector("/etc/nginx")
+	websites, webWarnings := nginxCol.Collect(collectCtx)
+	for _, w := range webWarnings {
+		addWarning(&payload.Warnings, w)
+	}
+
+	apacheCol := apache.NewCollector([]string{"/etc/apache2", "/etc/httpd"})
+	apacheSites, apacheWarnings := apacheCol.Collect(collectCtx)
+	for _, w := range apacheWarnings {
+		addWarning(&payload.Warnings, w)
+	}
+
+	// Merge apacheSites into websites without creating duplicate identities
+	websiteMap := make(map[string]*models.WebsiteCandidate)
+	for i := range websites {
+		if len(websites[i].Domains) > 0 {
+			primary := websites[i].Domains[0].Name
+			websiteMap[primary] = &websites[i]
+		}
+	}
+	for i := range apacheSites {
+		if len(apacheSites[i].Domains) > 0 {
+			primary := apacheSites[i].Domains[0].Name
+			if existing, ok := websiteMap[primary]; ok {
+				// Nginx takes precedence, but we can append evidence
+				existing.Evidence = append(existing.Evidence, apacheSites[i].Evidence...)
+			} else {
+				websiteMap[primary] = &apacheSites[i]
+				websites = append(websites, apacheSites[i])
+			}
+		}
+	}
+
+	payload.Websites = append(payload.Websites, websites...)
+
+	// Execute OS User / Hosting Discovery
+	userCol := users.NewCollector("/etc/passwd", "/home")
+	hostingUsers, userWarnings := userCol.Collect(collectCtx, payload.Websites)
+	for _, w := range userWarnings {
+		addWarning(&payload.Warnings, w)
+	}
+	payload.HostingUsers = hostingUsers
+
 	return payload
 }
 
